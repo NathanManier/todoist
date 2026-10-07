@@ -1,3 +1,2 @@
-icalendar>=5.0.0
-todoist-api-python>=2.1.0
-requests>=2.28.0
+icalendar==7.3.0
+requests==2.34.2
