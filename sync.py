@@ -1,523 +1,479 @@
 #!/usr/bin/env python3
-"""
-Canvas to Todoist Sync
-
-Synchronizes Canvas LMS assignments from an ICS calendar feed to Todoist tasks.
-Handles deduplication, updates, and organizes tasks with labels by course.
-
-Runs hourly via GitHub Actions.
-"""
-
+"""Canvas calendar sync with optional grade context and bounded study sessions."""
+import argparse
 import hashlib
 import json
 import logging
 import os
 import re
-import sys
-from datetime import datetime, timedelta, timezone
+import tempfile
+import uuid
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from icalendar import Calendar
-from todoist_api_python.api import TodoistAPI
+from canvas_data import (CanvasClient, assessment_type, confirmed_submitted,
+                         current_grade, grade_impact, match_assignment)
 
-# Reminder settings
-REMINDER_DAYS_BEFORE = int(os.environ.get("REMINDER_DAYS_BEFORE", "1"))  # Days before due date
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+UTC = timezone.utc
 logger = logging.getLogger(__name__)
 
-# Configuration
-CANVAS_ICS_URL = os.environ.get("CANVAS_ICS_URL", "")
-TODOIST_API_TOKEN = os.environ.get("TODOIST_API_TOKEN", "")
-PROJECT_NAME = os.environ.get("TODOIST_PROJECT_NAME", "Canvas Assignments")
-STATE_FILE = os.environ.get("STATE_FILE", "sync_state.json")
 
-# Priority mapping based on days until due
-# Todoist priorities: 4 = urgent (red), 3 = high (orange), 2 = medium (yellow), 1 = normal
-PRIORITY_THRESHOLDS = {
-    1: 4,   # Due within 1 day -> urgent
-    3: 3,   # Due within 3 days -> high
-    7: 2,   # Due within 7 days -> medium
-}
-DEFAULT_PRIORITY = 1  # Normal priority for assignments due later
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
-class SyncState:
-    """Manages persistent state for tracking synced assignments."""
-
-    def __init__(self, state_file: str):
-        self.state_file = Path(state_file)
-        self.state = self._load()
-
-    def _load(self) -> dict:
-        """Load state from file."""
-        if self.state_file.exists():
-            try:
-                with open(self.state_file, "r") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"Could not load state file: {e}. Starting fresh.")
-        return {"synced_events": {}, "last_sync": None}
-
-    def save(self):
-        """Save state to file."""
-        self.state["last_sync"] = datetime.now(timezone.utc).isoformat()
-        with open(self.state_file, "w") as f:
-            json.dump(self.state, f, indent=2)
-        logger.info(f"State saved to {self.state_file}")
-
-    def get_synced_event(self, event_uid: str) -> Optional[dict]:
-        """Get info about a previously synced event."""
-        return self.state["synced_events"].get(event_uid)
-
-    def mark_synced(self, event_uid: str, todoist_task_id: str, event_hash: str, due_date: str = None):
-        """Mark an event as synced."""
-        self.state["synced_events"][event_uid] = {
-            "todoist_task_id": todoist_task_id,
-            "event_hash": event_hash,
-            "synced_at": datetime.now(timezone.utc).isoformat(),
-            "due_date": due_date,
-        }
-
-    def mark_completed(self, event_uid: str):
-        """Mark an event as auto-completed (remove from tracking)."""
-        if event_uid in self.state["synced_events"]:
-            del self.state["synced_events"][event_uid]
-
-    def get_all_synced_uids(self) -> set:
-        """Get all synced event UIDs."""
-        return set(self.state["synced_events"].keys())
+def request_id(key):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'canvas-todoist:' + key))
 
 
-def fetch_ics_feed(url: str) -> str:
-    """Fetch the ICS calendar feed from Canvas."""
-    logger.info(f"Fetching ICS feed from Canvas...")
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        logger.info(f"Successfully fetched ICS feed ({len(response.text)} bytes)")
-        return response.text
-    except requests.RequestException as e:
-        logger.error(f"Failed to fetch ICS feed: {e}")
-        raise
+def sanitize_label_name(name):
+    return re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', name)).strip('_')[:60] or 'General'
 
 
-def parse_course_name(summary: str, description: str = "") -> str:
-    """Extract course name from event summary or description."""
-    # Canvas typically formats as: "Assignment Name [Course Name]"
-    # or includes course info in the description
-
-    bracket_match = re.search(r'\[([^\]]+)\]', summary)
-    if bracket_match:
-        return bracket_match.group(1).strip()
-
-    # Try to find course pattern in description (e.g., "CHEM 350")
-    course_pattern = re.search(r'([A-Z]{2,4}\s*\d{3}[A-Z]?)', summary + " " + description)
-    if course_pattern:
-        return course_pattern.group(1).strip()
-
-    # Fallback: use first part before colon or dash
-    for sep in [':', ' - ', ' – ']:
-        if sep in summary:
-            return summary.split(sep)[0].strip()
-
-    return "General"
+def parse_course_name(summary, description=''):
+    bracket = re.search(r'\[([^\]]+)\]\s*$', summary)
+    if bracket:
+        return bracket.group(1).strip()
+    code = re.search(r'\b[A-Z]{2,6}[-\s]?\d{3,4}(?:-[A-Z0-9]+)*\b', summary + ' ' + description)
+    return code.group() if code else 'General'
 
 
-def parse_assignment_title(summary: str) -> str:
-    """Clean up assignment title, removing course brackets."""
-    # Remove [Course Name] suffix if present
-    title = re.sub(r'\s*\[[^\]]+\]\s*$', '', summary)
-    return title.strip()
+def calculate_priority(due, now):
+    days = (due - now).total_seconds() / 86400
+    return next((p for threshold, p in [(1, 4), (3, 3), (7, 2)] if days <= threshold), 1)
 
 
-def compute_event_hash(event: dict) -> str:
-    """Compute a hash of event details for change detection."""
-    hash_content = f"{event['summary']}|{event['due_date']}|{event['description']}"
-    return hashlib.md5(hash_content.encode()).hexdigest()
-
-
-def calculate_priority(due_date: datetime) -> int:
-    """Calculate Todoist priority based on days until due."""
-    now = datetime.now(timezone.utc)
-
-    # Handle naive datetimes
-    if due_date.tzinfo is None:
-        due_date = due_date.replace(tzinfo=timezone.utc)
-
-    days_until_due = (due_date - now).days
-
-    for threshold_days, priority in sorted(PRIORITY_THRESHOLDS.items()):
-        if days_until_due <= threshold_days:
-            return priority
-
-    return DEFAULT_PRIORITY
-
-
-def parse_ics_events(ics_content: str) -> list[dict]:
-    """Parse ICS content and extract assignment events."""
-    calendar = Calendar.from_ical(ics_content)
-    events = []
-
-    for component in calendar.walk():
-        if component.name != "VEVENT":
+def parse_ics_events(content, zone, now):
+    events, seen = [], set()
+    for component in Calendar.from_ical(content).walk('VEVENT'):
+        uid = str(component.get('uid', ''))
+        if not uid or uid in seen or str(component.get('status', '')).upper() == 'CANCELLED':
             continue
-
-        # Extract event details
-        uid = str(component.get("uid", ""))
-        summary = str(component.get("summary", ""))
-        description = str(component.get("description", ""))
-
-        # Get due date (DTEND or DTSTART)
-        dt = component.get("dtend") or component.get("dtstart")
+        start, end = component.get('dtstart'), component.get('dtend')
+        dt = start or end
         if dt is None:
-            logger.warning(f"Skipping event without date: {summary}")
             continue
-
-        due_date = dt.dt
-        # Convert date to datetime if needed
-        if not isinstance(due_date, datetime):
-            due_date = datetime.combine(due_date, datetime.min.time(), tzinfo=timezone.utc)
-        elif due_date.tzinfo is None:
-            due_date = due_date.replace(tzinfo=timezone.utc)
-
-        # Skip past events
-        if due_date < datetime.now(timezone.utc):
-            logger.debug(f"Skipping past event: {summary}")
-            continue
-
-        course_name = parse_course_name(summary, description)
-        title = parse_assignment_title(summary)
-
-        event = {
-            "uid": uid,
-            "summary": summary,
-            "title": title,
-            "description": description,
-            "due_date": due_date.isoformat(),
-            "due_datetime": due_date,
-            "course": course_name,
-            "priority": calculate_priority(due_date),
-        }
-        events.append(event)
-
-    logger.info(f"Parsed {len(events)} upcoming events from ICS feed")
+        all_day = not isinstance(dt.dt, datetime)
+        # All-day DTEND is exclusive, not the assignment's deadline.
+        due = datetime.combine(dt.dt, time(23, 59, 59), zone) if all_day else (end or start).dt
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=zone)
+        summary = str(component.get('summary', ''))
+        description = str(component.get('description', ''))
+        events.append({'uid': uid, 'title': re.sub(r'\s*\[[^\]]+\]\s*$', '', summary).strip(),
+                       'course': parse_course_name(summary, description), 'description': description,
+                       'url': str(component.get('url', '')), 'due': due,
+                       'date_only': all_day, 'priority': calculate_priority(due, now)})
+        seen.add(uid)
     return events
 
 
-def sanitize_label_name(name: str) -> str:
-    """Sanitize a string to be a valid Todoist label name."""
-    # Remove special characters, replace spaces with underscores
-    sanitized = re.sub(r'[^\w\s-]', '', name)
-    sanitized = re.sub(r'\s+', '_', sanitized)
-    return sanitized.strip('_')
+class SyncState:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.exists = self.path.exists()
+        if self.exists:
+            data = json.loads(self.path.read_text())
+            if not isinstance(data, dict):
+                raise ValueError('Invalid sync state.')
+            if 'records' not in data:
+                if not isinstance(data.get('synced_events'), dict):
+                    raise ValueError('Unrecognized sync state format.')
+                data['records'] = {
+                    'assignment:' + uid: {'task_id': str(info['todoist_task_id']),
+                                         'kind': 'assignment', 'uid': uid, 'status': 'active',
+                                         'legacy_reminder': True,
+                                         'due': info.get('due_date'), 'payload_hash': None}
+                    for uid, info in data['synced_events'].items()
+                }
+            if not isinstance(data['records'], dict):
+                raise ValueError('Invalid sync records.')
+            self.records = data['records']
+        else:
+            self.records = {}
 
-
-class TodoistSync:
-    """Handles Todoist API operations for syncing."""
-
-    def __init__(self, api_token: str):
-        self.api = TodoistAPI(api_token)
-        self.api_token = api_token
-        self._projects_cache = None
-        self._labels_cache = None
-
-    def _get_all_projects(self) -> list:
-        """Get all projects, handling paginator responses."""
-        result = self.api.get_projects()
-        # The paginator returns pages (lists of projects), flatten them
-        all_projects = []
-        for page in result:
-            if isinstance(page, list):
-                all_projects.extend(page)
-            else:
-                all_projects.append(page)
-        return all_projects
-
-    def _get_all_labels(self) -> list:
-        """Get all labels, handling paginator responses."""
-        result = self.api.get_labels()
-        # The paginator returns pages (lists of labels), flatten them
-        all_labels = []
-        for page in result:
-            if isinstance(page, list):
-                all_labels.extend(page)
-            else:
-                all_labels.append(page)
-        return all_labels
-
-    def get_or_create_project(self, name: str) -> str:
-        """Get existing project or create new one. Returns project ID."""
-        if self._projects_cache is None:
-            projects = self._get_all_projects()
-            self._projects_cache = {p.name: p.id for p in projects}
-
-        if name in self._projects_cache:
-            logger.info(f"Using existing project: {name}")
-            return self._projects_cache[name]
-
-        logger.info(f"Creating new project: {name}")
-        project = self.api.add_project(name=name)
-        self._projects_cache[name] = project.id
-        return project.id
-
-    def get_or_create_label(self, name: str) -> str:
-        """Get existing label or create new one. Returns label name."""
-        sanitized_name = sanitize_label_name(name)
-
-        if self._labels_cache is None:
-            labels = self._get_all_labels()
-            self._labels_cache = {l.name: l.id for l in labels}
-
-        if sanitized_name in self._labels_cache:
-            return sanitized_name
-
-        logger.info(f"Creating new label: {sanitized_name}")
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix='.sync-state-', suffix='.tmp')
         try:
-            label = self.api.add_label(name=sanitized_name)
-            self._labels_cache[label.name] = label.id
-            return label.name
-        except Exception as e:
-            logger.warning(f"Could not create label {sanitized_name}: {e}")
-            return sanitized_name
+            with os.fdopen(fd, 'w') as stream:
+                json.dump({'version': 2, 'records': self.records}, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
-    def create_task(
-        self,
-        title: str,
-        project_id: str,
-        due_datetime: datetime,
-        description: str = "",
-        labels: list[str] = None,
-        priority: int = 1,
-    ) -> str:
-        """Create a new Todoist task. Returns task ID."""
-        # Format due string for Todoist
-        due_string = due_datetime.strftime("%Y-%m-%d at %H:%M")
 
-        task = self.api.add_task(
-            content=title,
-            project_id=project_id,
-            description=description[:16383] if description else "",  # Todoist limit
-            due_string=due_string,
-            labels=labels or [],
-            priority=priority,
-        )
+class Todoist:
+    def __init__(self, token, session=None):
+        self.session = session or requests.Session()
+        self.session.headers.update({'Authorization': f'Bearer {token}'})
+        self.labels = None
 
-        logger.info(f"Created task: {title} (ID: {task.id})")
-        return task.id
-
-    def update_task(
-        self,
-        task_id: str,
-        title: str = None,
-        due_datetime: datetime = None,
-        description: str = None,
-        priority: int = None,
-    ):
-        """Update an existing Todoist task."""
-        kwargs = {}
-        if title:
-            kwargs["content"] = title
-        if due_datetime:
-            kwargs["due_string"] = due_datetime.strftime("%Y-%m-%d at %H:%M")
-        if description is not None:
-            kwargs["description"] = description[:16383]
-        if priority:
-            kwargs["priority"] = priority
-
-        if kwargs:
-            self.api.update_task(task_id=task_id, **kwargs)
-            logger.info(f"Updated task: {task_id}")
-
-    def task_exists(self, task_id: str) -> bool:
-        """Check if a task still exists (not deleted/completed)."""
+    def call(self, method, path, payload=None, key=None, params=None, missing_ok=False):
         try:
-            self.api.get_task(task_id=task_id)
-            return True
-        except Exception:
-            return False
+            response = self.session.request(
+                method, 'https://api.todoist.com/api/v1/' + path, json=payload, params=params,
+                headers={'X-Request-ID': request_id(key)} if key else {}, timeout=30,
+                allow_redirects=False)
+            if missing_ok and response.status_code in (404, 410):
+                return None
+            if not 200 <= response.status_code < 300:
+                raise RuntimeError(f'Todoist {method} failed (HTTP {response.status_code}). '
+                                   'Saved progress will be retried; check permissions, plan, or rate limits.')
+            return response.json() if response.content else None
+        except requests.RequestException:
+            raise RuntimeError('Todoist could not be reached; saved progress will be retried.') from None
 
-    def complete_task(self, task_id: str) -> bool:
-        """Mark a task as complete. Returns True if successful."""
-        try:
-            self.api.close_task(task_id=task_id)
-            logger.info(f"Completed task: {task_id}")
-            return True
-        except Exception as e:
-            logger.warning(f"Could not complete task {task_id}: {e}")
-            return False
+    def list(self, path, params=None):
+        result, cursor, seen = [], None, set()
+        while True:
+            page = self.call('GET', path, params={**(params or {}), 'limit': 200,
+                                                **({'cursor': cursor} if cursor else {})})
+            result.extend(page['results'])
+            cursor = page.get('next_cursor')
+            if not cursor:
+                return result
+            if cursor in seen:
+                raise RuntimeError('Todoist returned a repeated pagination cursor.')
+            seen.add(cursor)
 
-    def add_reminder(self, task_id: str, remind_at: datetime) -> bool:
-        """Add a reminder to a task using the Sync API."""
-        try:
-            # Use Todoist Sync API for reminders (REST API doesn't support them)
-            import uuid
-            temp_id = str(uuid.uuid4())
+    def project(self, name):
+        for project in self.list('projects'):
+            if project['name'] == name:
+                return str(project['id'])
+        return str(self.call('POST', 'projects', {'name': name}, key=str(uuid.uuid4()))['id'])
 
-            # Format the reminder time
-            remind_str = remind_at.strftime("%Y-%m-%dT%H:%M:%S")
-
-            response = requests.post(
-                "https://api.todoist.com/sync/v9/sync",
-                headers={"Authorization": f"Bearer {self.api_token}"},
-                json={
-                    "commands": [
-                        {
-                            "type": "reminder_add",
-                            "temp_id": temp_id,
-                            "uuid": str(uuid.uuid4()),
-                            "args": {
-                                "item_id": task_id,
-                                "due": {"date": remind_str},
-                            },
-                        }
-                    ]
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            logger.info(f"Added reminder for task {task_id} at {remind_str}")
-            return True
-        except Exception as e:
-            logger.warning(f"Could not add reminder for task {task_id}: {e}")
-            return False
+    def ensure_labels(self, names):
+        if self.labels is None:
+            self.labels = {label['name'] for label in self.list('labels')}
+        for name in names:
+            if name not in self.labels:
+                self.call('POST', 'labels', {'name': name}, key=str(uuid.uuid4()))
+                self.labels.add(name)
 
 
-def sync_canvas_to_todoist():
-    """Main sync function."""
-    logger.info("=" * 50)
-    logger.info("Starting Canvas to Todoist sync")
-    logger.info("=" * 50)
+def active(task):
+    return task is not None and not any(task.get(field) for field in ('checked', 'is_completed', 'is_deleted'))
 
-    # Validate configuration
-    if not TODOIST_API_TOKEN:
-        logger.error("TODOIST_API_TOKEN environment variable is not set")
-        sys.exit(1)
 
-    if not CANVAS_ICS_URL:
-        logger.error("CANVAS_ICS_URL environment variable is not set")
-        sys.exit(1)
+def upsert(todoist, state, key, payload, metadata):
+    record = state.records.get(key)
+    generation = (record or {}).get('generation', 0)
+    if record and record.get('status') == 'cancelled' and metadata.get('kind') == 'study':
+        generation += 1
+        record = None  # The assessment moved back; only our own cancellations can return.
+    if record and record.get('status') != 'active':
+        return None  # Completed/deleted tasks stay completed/deleted.
+    digest = fingerprint(payload)
+    if record:
+        existing = todoist.call('GET', 'tasks/' + record['task_id'], missing_ok=True)
+        if not active(existing):
+            record['status'] = 'done'
+            state.save()
+            return None
+        if record.get('payload_hash') != digest:
+            manual = set(existing.get('labels', [])) - set(record.get('managed_labels', []))
+            updated = {**payload, 'labels': sorted(manual | set(payload['labels']))}
+            updated.pop('project_id', None)
+            todoist.ensure_labels(payload['labels'])
+            todoist.call('POST', 'tasks/' + record['task_id'], updated,
+                         key=str(uuid.uuid4()))
+    else:
+        todoist.ensure_labels(payload['labels'])
+        task = todoist.call('POST', 'tasks', payload,
+                            key=f"create:{payload['project_id']}:{key}:{generation}")
+        record = {'task_id': str(task['id']), 'status': 'active', 'generation': generation}
+        state.records[key] = record
+    record.update(metadata)
+    record.update(payload_hash=digest, managed_labels=payload['labels'])
+    state.save()  # Commit task ID before a reminder can fail.
+    return record
 
-    # Initialize components
-    state = SyncState(STATE_FILE)
-    todoist = TodoistSync(TODOIST_API_TOKEN)
 
-    # Fetch and parse ICS feed
-    try:
-        ics_content = fetch_ics_feed(CANVAS_ICS_URL)
-        events = parse_ics_events(ics_content)
-    except Exception as e:
-        logger.error(f"Failed to fetch/parse ICS feed: {e}")
-        sys.exit(1)
-
-    if not events:
-        logger.info("No upcoming events found in ICS feed")
+def sync_reminder(todoist, state, record, when, now):
+    wanted = when.astimezone(UTC).isoformat() if when and when > now else None
+    if wanted and record.get('legacy_reminder'):
+        # Adopt an existing reminder at this exact instant during an upgrade.
+        # Do not touch unrelated reminders the user may have configured.
+        for reminder in todoist.list('reminders', {'task_id': record['task_id']}):
+            due = reminder.get('due') or {}
+            try:
+                old_when = datetime.fromisoformat(due.get('date', '').replace('Z', '+00:00'))
+                if old_when.tzinfo is None:
+                    old_when = old_when.replace(tzinfo=ZoneInfo(due.get('timezone') or 'UTC'))
+                if old_when == when:
+                    record['reminder_id'] = str(reminder['id'])
+                    record['reminder_at'] = wanted
+                    break
+            except (ValueError, KeyError):
+                continue
+        record.pop('legacy_reminder', None)
         state.save()
+    if wanted == record.get('reminder_at'):
         return
-
-    # Get or create the Canvas project
-    project_id = todoist.get_or_create_project(PROJECT_NAME)
-
-    # Process each event
-    stats = {"created": 0, "updated": 0, "skipped": 0, "completed": 0}
-
-    # Get current event UIDs for auto-complete detection
-    current_event_uids = {event["uid"] for event in events}
-
-    # Check for assignments that disappeared (likely submitted)
-    for event_uid in list(state.get_all_synced_uids()):
-        if event_uid not in current_event_uids:
-            synced_info = state.get_synced_event(event_uid)
-            if synced_info and synced_info.get("due_date"):
-                try:
-                    due_date = datetime.fromisoformat(synced_info["due_date"])
-                    # If due date is still in the future, assignment was likely submitted
-                    if due_date > datetime.now(timezone.utc):
-                        task_id = synced_info["todoist_task_id"]
-                        if todoist.task_exists(task_id):
-                            logger.info(f"Assignment disappeared from Canvas (likely submitted), completing task: {task_id}")
-                            if todoist.complete_task(task_id):
-                                stats["completed"] += 1
-                        state.mark_completed(event_uid)
-                except (ValueError, TypeError) as e:
-                    logger.debug(f"Could not parse due date for {event_uid}: {e}")
-
-    for event in events:
-        event_uid = event["uid"]
-        event_hash = compute_event_hash(event)
-
-        # Check if already synced
-        synced_info = state.get_synced_event(event_uid)
-
-        if synced_info:
-            # Check if event has changed
-            if synced_info["event_hash"] == event_hash:
-                logger.debug(f"Skipping unchanged event: {event['title']}")
-                stats["skipped"] += 1
-                continue
-
-            # Check if task still exists
-            if todoist.task_exists(synced_info["todoist_task_id"]):
-                # Update existing task
-                logger.info(f"Updating changed event: {event['title']}")
-                todoist.update_task(
-                    task_id=synced_info["todoist_task_id"],
-                    title=event["title"],
-                    due_datetime=event["due_datetime"],
-                    description=event["description"],
-                    priority=event["priority"],
-                )
-                state.mark_synced(event_uid, synced_info["todoist_task_id"], event_hash, event["due_date"])
-                stats["updated"] += 1
-                continue
-
-        # Create new task
-        logger.info(f"Creating new task for: {event['title']}")
-
-        # Get or create label for course
-        course_label = todoist.get_or_create_label(event["course"])
-
-        try:
-            task_id = todoist.create_task(
-                title=event["title"],
-                project_id=project_id,
-                due_datetime=event["due_datetime"],
-                description=event["description"],
-                labels=[course_label],
-                priority=event["priority"],
-            )
-
-            # Add reminder for 1 day before due date
-            if REMINDER_DAYS_BEFORE > 0:
-                reminder_time = event["due_datetime"] - timedelta(days=REMINDER_DAYS_BEFORE)
-                # Only add reminder if it's in the future
-                if reminder_time > datetime.now(timezone.utc):
-                    todoist.add_reminder(task_id, reminder_time)
-
-            state.mark_synced(event_uid, task_id, event_hash, event["due_date"])
-            stats["created"] += 1
-        except Exception as e:
-            logger.error(f"Failed to create task for {event['title']}: {e}")
-
-    # Save state
+    old_id = record.get('reminder_id')
+    if not wanted:
+        if old_id:
+            todoist.call('DELETE', 'reminders/' + old_id, missing_ok=True, key='remove-reminder:' + old_id)
+        record.pop('reminder_id', None)
+        record.pop('reminder_at', None)
+    else:
+        due = {'date': when.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%S'), 'timezone': 'UTC'}
+        result = None
+        if old_id:
+            result = todoist.call('POST', 'reminders/' + old_id, {'due': due, 'service': 'push'},
+                                  key=str(uuid.uuid4()), missing_ok=True)
+        if result is None:
+            result = todoist.call('POST', 'reminders',
+                                  {'task_id': record['task_id'], 'reminder_type': 'absolute',
+                                   'due': due, 'service': 'push'},
+                                  key='reminder:' + record['task_id'] + ':' + wanted)
+        record['reminder_id'] = str(result['id'])
+        record['reminder_at'] = wanted
     state.save()
 
-    # Summary
-    logger.info("=" * 50)
-    logger.info("Sync complete!")
-    logger.info(f"  Created: {stats['created']}")
-    logger.info(f"  Updated: {stats['updated']}")
-    logger.info(f"  Skipped: {stats['skipped']}")
-    logger.info(f"  Auto-completed: {stats['completed']}")
-    logger.info("=" * 50)
+
+def retire(todoist, state, key, delete=False):
+    record = state.records[key]
+    if record.get('status') != 'active':
+        return
+    task = todoist.call('GET', 'tasks/' + record['task_id'], missing_ok=True)
+    if active(task):
+        method, suffix = ('DELETE', '') if delete else ('POST', '/close')
+        todoist.call(method, 'tasks/' + record['task_id'] + suffix,
+                     key='retire:' + key + ':' + record['task_id'], missing_ok=True)
+    record['status'] = 'cancelled' if delete and active(task) else 'done'
+    state.save()
 
 
-if __name__ == "__main__":
-    sync_canvas_to_todoist()
+def study_dates(due, now, zone, days=7, hour='18:00'):
+    study_time = time.fromisoformat(hour)
+    end = due.astimezone(zone).date()
+    dates = [datetime.combine(end - timedelta(days=offset), study_time, zone)
+             for offset in range(days, 0, -1)]
+    return [d for d in dates if now < d < due]
+
+
+def enrich(events, snapshot, now):
+    for event in events:
+        assignment, context = match_assignment(event, snapshot)
+        event.update(assignment=assignment, submitted=confirmed_submitted(assignment),
+                     study_allowed=True, impact=None,
+                     impact_note='Unavailable: connect the Canvas API to calculate assignment weight.')
+        if context:
+            course = context['course']
+            event['course'] = course.get('course_code') or course['name']
+            event['url'] = assignment.get('html_url') or event['url']
+            event['title'] = assignment.get('name') or event['title']
+            if assignment.get('due_at'):
+                event['due'] = datetime.fromisoformat(assignment['due_at'].replace('Z', '+00:00'))
+                event['date_only'] = False
+            else:
+                event['study_allowed'] = False
+            result = grade_impact(assignment, course, context['groups'], context['assignments'])
+            event['impact'], event['impact_note'] = result.percent, result.explanation
+        elif snapshot:
+            event['impact_note'] = 'Unavailable: this calendar entry could not be matched to a Canvas assignment.'
+        event['kind_label'] = assessment_type(event['title'], assignment)
+        event['priority'] = calculate_priority(event['due'], now)
+    return events
+
+
+def assignment_payload(event, project_id):
+    labels = [sanitize_label_name(event['course'])]
+    if event['kind_label']:
+        labels.append(event['kind_label'])
+    impact = event['impact']
+    if impact is not None and impact >= 5:
+        labels.append('High_grade_impact')
+    description = f"Course: {event['course']}\n"
+    if impact is not None:
+        description += f"Estimated share of final grade: {impact:.2f}%\n"
+    description += event['impact_note'] + '\n'
+    points = (event['assignment'] or {}).get('points_possible')
+    if points is not None:
+        description += f'Points possible: {points}\n'
+    if event['url']:
+        description += f"\nCanvas: {event['url']}\n"
+    description += '\n' + event['description']
+    due = {'due_date': event['due'].date().isoformat()} if event['date_only'] else {
+        'due_datetime': event['due'].astimezone(UTC).isoformat()}
+    return {'content': event['title'][:500], 'project_id': project_id,
+            'description': description[:16383], 'labels': labels, 'priority': event['priority'], **due}
+
+
+def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study_time='18:00',
+                reminder_days=1, summaries=True, project_name='Canvas Assignments'):
+    project = todoist.project(project_name)
+    done = set()
+    reminder_failures = 0
+
+    def remind(record, when):
+        nonlocal reminder_failures
+        try:
+            sync_reminder(todoist, state, record, when, now)
+        except RuntimeError:
+            reminder_failures += 1
+    for key, record in list(state.records.items()):
+        if record.get('kind') != 'assignment':
+            continue
+        assignment, _ = match_assignment({'uid': record['uid'], 'url': record.get('canvas_url', '')}, snapshot)
+        if confirmed_submitted(assignment):
+            retire(todoist, state, key)
+            done.add(record['uid'])
+    for event in events:
+        uid, key = event['uid'], 'assignment:' + event['uid']
+        record = state.records.get(key)
+        if event['submitted']:
+            if record:
+                retire(todoist, state, key)
+            done.add(uid)
+            continue
+        if event['due'] <= now:
+            if record:
+                existing_record = upsert(todoist, state, key, assignment_payload(event, project),
+                                         {'kind': 'assignment', 'uid': uid, 'due': event['due'].isoformat(),
+                                          'canvas_url': event['url']})
+                if existing_record:
+                    remind(existing_record, None)
+            for old_key, old in list(state.records.items()):
+                if old.get('kind') == 'study' and old['uid'] == uid and datetime.fromisoformat(old['due']) > now:
+                    retire(todoist, state, old_key, delete=True)
+            continue
+        payload = assignment_payload(event, project)
+        record = upsert(todoist, state, key, payload,
+                        {'kind': 'assignment', 'uid': uid, 'due': event['due'].isoformat(), 'canvas_url': event['url']})
+        if record is None:
+            done.add(uid)
+            continue
+        remind_at = event['due'] - timedelta(days=reminder_days) if reminder_days > 0 else None
+        remind(record, remind_at)
+        wanted = set()
+        if event['kind_label'] and event['study_allowed']:
+            for when in study_dates(event['due'], now, zone, study_days, study_time):
+                study_key = f'study:{uid}:{when.date().isoformat()}'
+                wanted.add(study_key)
+                study_payload = {
+                    'content': f"Study: {event['title']} — {event['course']}"[:500],
+                    'description': (f"Prepare for {event['title']}.\n"
+                                    f"Assessment due: {event['due'].astimezone(zone).strftime('%b %d, %Y at %I:%M %p %Z')}\n\n"
+                                    + payload['description'])[:16383],
+                    'project_id': project, 'labels': [*payload['labels'], 'Study'],
+                    'priority': event['priority'], 'due_datetime': when.astimezone(UTC).isoformat(),
+                }
+                study_record = upsert(todoist, state, study_key, study_payload,
+                                      {'kind': 'study', 'uid': uid, 'due': when.isoformat()})
+                if study_record:
+                    remind(study_record, when)
+        for old_key, old in list(state.records.items()):
+            if old.get('kind') == 'study' and old['uid'] == uid and old_key not in wanted:
+                if datetime.fromisoformat(old['due']) > now:
+                    retire(todoist, state, old_key, delete=True)
+    for key, record in list(state.records.items()):
+        if record.get('kind') == 'study' and record['uid'] in done:
+            retire(todoist, state, key, delete=True)
+    if summaries and snapshot:
+        grades_project = todoist.project('Canvas Grades')
+        for cid, context in snapshot.items():
+            course = context['course']
+            name = course.get('course_code') or course['name']
+            score = current_grade(course)
+            display = f'{score:.2f}%' if score is not None else 'Grade unavailable'
+            description = ('Canvas current grade (graded work), not a forecast of the final grade. '
+                           'Ungraded work may be excluded.\n' if score is not None else
+                           'Canvas did not provide a visible current grade. This does not mean zero.\n')
+            weights = [f"{g['name']}: {g['group_weight']:g}%" for g in context['groups']
+                       if isinstance(g.get('group_weight'), (int, float))]
+            if course.get('apply_assignment_group_weights') and weights:
+                description += '\nGrading categories:\n' + '\n'.join(weights) + '\n'
+            description += f'\nLast checked: {now.astimezone(zone).date()}\nOpen Canvas for official grades.'
+            if context.get('grade_url'):
+                description += '\n' + context['grade_url']
+            upsert(todoist, state, 'grade:' + cid,
+                   {'content': f'{name} — {display}'[:500], 'description': description[:16383],
+                    'project_id': grades_project, 'labels': [sanitize_label_name(name), 'Grade'], 'priority': 1},
+                   {'kind': 'grade', 'course_id': cid})
+    if reminder_failures:
+        raise RuntimeError(f'Tasks were saved, but {reminder_failures} reminder operations failed. '
+                           'Check Todoist reminder access and retry; saved tasks will not be recreated.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true', help='Read Canvas; never contact Todoist or save state.')
+    parser.add_argument('--initialize-state', action='store_true', help='Allow a first run without saved state.')
+    parser.add_argument('--preview-file', help='Write a private local JSON preview; do not publish it.')
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    try:
+        zone = ZoneInfo(os.getenv('STUDY_TIMEZONE', 'America/Los_Angeles'))
+        days, hour = int(os.getenv('STUDY_DAYS_BEFORE', '7')), os.getenv('STUDY_TIME', '18:00')
+        if not 0 <= days <= 30 or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', hour):
+            raise RuntimeError('Study settings require 0–30 days and a time in HH:MM format.')
+        reminder_days = int(os.getenv('REMINDER_DAYS_BEFORE', '1'))
+        if reminder_days < 0:
+            raise RuntimeError('REMINDER_DAYS_BEFORE cannot be negative.')
+        now = datetime.now(UTC)
+        feed = os.getenv('CANVAS_ICS_URL', '')
+        if not feed:
+            raise RuntimeError('CANVAS_ICS_URL is required.')
+        state = SyncState(os.getenv('STATE_FILE', 'sync_state.json'))
+        if not args.dry_run and not state.exists and not args.initialize_state:
+            raise RuntimeError('Saved sync state is missing. Restore it to prevent duplicates; '
+                             'use --initialize-state only for an intentional first sync.')
+        try:
+            response = requests.get(feed, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException:
+            raise RuntimeError('The Canvas calendar feed could not be read.') from None
+        events = parse_ics_events(response.text, zone, now)
+        token, snapshot = os.getenv('CANVAS_API_TOKEN', ''), {}
+        if token:
+            site = os.getenv('CANVAS_BASE_URL') or f'https://{urlparse(feed).netloc}'
+            snapshot = CanvasClient(site, token).snapshot()
+        else:
+            logger.warning('Canvas API is not connected: grade data and verified auto-completion are unavailable.')
+        enrich(events, snapshot, now)
+        upcoming = [e for e in events if e['due'] > now and not e['submitted']]
+        if args.preview_file:
+            preview = {'assignments': [assignment_payload(e, '(preview)') for e in upcoming],
+                       'study_sessions': [{'assignment': e['title'], 'at': at.isoformat()}
+                                          for e in upcoming if e['kind_label'] and e['study_allowed']
+                                          for at in study_dates(e['due'], now, zone, days, hour)],
+                       'course_grades': [{'course': c['course'].get('course_code'),
+                                          'current_score': current_grade(c['course'])} for c in snapshot.values()]}
+            fd = os.open(args.preview_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(preview, stream, indent=2)
+        if args.dry_run:
+            logger.info('Preview: %d upcoming calendar entries; %d courses read. No Todoist changes.', len(upcoming), len(snapshot))
+            return 0
+        api_token = os.getenv('TODOIST_API_TOKEN', '')
+        if not api_token:
+            raise RuntimeError('TODOIST_API_TOKEN is required for a live sync.')
+        synchronize(Todoist(api_token), state, events, snapshot, now, zone, days, hour,
+                    reminder_days, os.getenv('SYNC_COURSE_GRADES', 'true').lower() == 'true',
+                    os.getenv('TODOIST_PROJECT_NAME', 'Canvas Assignments'))
+        state.save()
+        logger.info('Sync completed. Task details and grades are omitted from logs.')
+        return 0
+    except Exception as error:
+        # Network exception strings can expose the private calendar URL.
+        if isinstance(error, RuntimeError):
+            logger.error('%s', error)
+        elif isinstance(error, ValueError) and not isinstance(error, requests.RequestException):
+            logger.error('Invalid configuration or data (%s). No fresh state will be assumed.', type(error).__name__)
+        else:
+            logger.error('Sync stopped (%s). Saved progress is retained.', type(error).__name__)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

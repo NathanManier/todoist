@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  pull_request:
+    paths: ['**.py', 'requirements.txt', '.github/workflows/**']
+  push:
+    paths: ['**.py', 'requirements.txt', '.github/workflows/**']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q

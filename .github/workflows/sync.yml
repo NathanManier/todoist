@@ -7,18 +7,36 @@ on:
 
   # Allow manual trigger
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview counts only; do not change Todoist'
+        type: boolean
+        default: true
+      initialize_state:
+        description: 'FIRST SYNC ONLY: allow missing state (can duplicate existing tasks)'
+        type: boolean
+        default: false
 
   # Run on push to master for testing
   push:
     branches: [master]
     paths:
       - 'sync.py'
+      - 'canvas_data.py'
       - 'requirements.txt'
       - '.github/workflows/sync.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canvas-todoist-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -34,10 +52,11 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore sync state
-        uses: actions/cache@v4
+        id: restore
+        uses: actions/cache/restore@v4
         with:
           path: sync_state.json
-          key: sync-state-${{ github.run_id }}
+          key: sync-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sync-state-
 
@@ -45,12 +64,25 @@ jobs:
         env:
           TODOIST_API_TOKEN: ${{ secrets.TODOIST_API_TOKEN }}
           CANVAS_ICS_URL: ${{ secrets.CANVAS_ICS_URL }}
+          CANVAS_API_TOKEN: ${{ secrets.CANVAS_API_TOKEN }}
+          CANVAS_BASE_URL: ${{ vars.CANVAS_BASE_URL }}
           TODOIST_PROJECT_NAME: "Canvas Assignments"
-        run: python sync.py
+          STUDY_DAYS_BEFORE: ${{ vars.STUDY_DAYS_BEFORE || '7' }}
+          STUDY_TIME: ${{ vars.STUDY_TIME || '18:00' }}
+          STUDY_TIMEZONE: ${{ vars.STUDY_TIMEZONE || 'America/Los_Angeles' }}
+          SYNC_COURSE_GRADES: ${{ vars.SYNC_COURSE_GRADES || 'true' }}
+          REMINDER_DAYS_BEFORE: ${{ vars.REMINDER_DAYS_BEFORE || '1' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          INITIALIZE_STATE: ${{ github.event_name == 'workflow_dispatch' && inputs.initialize_state }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$INITIALIZE_STATE" = "true" ]; then args+=(--initialize-state); fi
+          python sync.py "${args[@]}"
 
       - name: Save sync state
-        if: always()
+        if: always() && hashFiles('sync_state.json') != '' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
         uses: actions/cache/save@v4
         with:
           path: sync_state.json
-          key: sync-state-${{ github.run_id }}
+          key: sync-state-${{ github.run_id }}-${{ github.run_attempt }}

@@ -4,6 +4,9 @@
 
 # Sync state (generated at runtime)
 sync_state.json
+sync_state*.json
+.sync-state-*.tmp
+preview*.json
 
 # Python
 __pycache__/
