@@ -70,6 +70,7 @@ jobs:
           STUDY_DAYS_BEFORE: ${{ vars.STUDY_DAYS_BEFORE || '7' }}
           STUDY_TIME: ${{ vars.STUDY_TIME || '18:00' }}
           STUDY_TIMEZONE: ${{ vars.STUDY_TIMEZONE || 'America/Los_Angeles' }}
+          STUDY_EXCLUDED_COURSES: ${{ vars.STUDY_EXCLUDED_COURSES }}
           SYNC_COURSE_GRADES: ${{ vars.SYNC_COURSE_GRADES || 'true' }}
           REMINDER_DAYS_BEFORE: ${{ vars.REMINDER_DAYS_BEFORE || '1' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
