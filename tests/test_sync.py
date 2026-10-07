@@ -175,6 +175,62 @@ def test_late_discovery_only_schedules_remaining_days():
     assert [d.day for d in dates] == [9]
 
 
+def test_exclusions_match_full_course_identity_only():
+    exclusions = {sync.course_key('COMS-1102-V13-2268'), sync.course_key('Public Speaking')}
+    assert sync.excluded_course(['coms_1102_v13_2268'], exclusions)
+    assert sync.excluded_course(['PUBLIC SPEAKING'], exclusions)
+    assert not sync.excluded_course(['COMS-1102-V14-2268', 'Public Speaking Practice'], exclusions)
+
+
+def test_excluded_course_keeps_assignments_grades_and_other_course_study(tmp_path, snapshot):
+    state, api = sync.SyncState(tmp_path / 'state.json'), FakeTodoist()
+    speaking = event(snapshot)
+    other = {**event(), 'uid': 'other-quiz', 'course': 'BIO-1111'}
+    exclusions = {sync.course_key('COMS-1102-V13-2268')}
+    for _ in range(2):
+        sync.synchronize(api, state, [speaking, other], snapshot, NOW, ZONE, study_exclusions=exclusions)
+    assert state.records['assignment:' + speaking['uid']]['status'] == 'active'
+    assert state.records['grade:10']['status'] == 'active'
+    studies = [r for r in state.records.values() if r['kind'] == 'study']
+    assert len(studies) == 7
+    assert {r['uid'] for r in studies} == {'other-quiz'}
+    assert all(datetime.fromisoformat(r['due']).hour == 18 for r in studies)
+
+
+def test_exclusion_removes_legacy_overdue_and_future_tasks_even_without_feed(tmp_path):
+    state, api = sync.SyncState(tmp_path / 'state.json'), FakeTodoist()
+    run(api, state, [event()])
+    studies = [r for r in state.records.values() if r['kind'] == 'study']
+    # Model the version already deployed, which stored course labels only.
+    for record in studies:
+        record.pop('course')
+        record.pop('course_name')
+    completed_id = studies[0]['task_id']
+    api.tasks[completed_id]['checked'] = True
+    api.tasks['manual'] = {'id': 'manual', 'content': 'My own study plan', 'labels': ['Study', 'COMS-1102-V13-2268']}
+    exclusions = {sync.course_key('COMS-1102-V13-2268')}
+    later = datetime(2026, 10, 8, 22, tzinfo=UTC)
+    sync.synchronize(api, state, [], {}, later, ZONE, study_exclusions=exclusions)
+    assert len(api.tasks) == 3  # Parent assignment, completed session, and manual task.
+    assert api.tasks[completed_id]['checked']
+    assert 'manual' in api.tasks
+    assert sum(r['status'] == 'cancelled' for r in studies) == 6
+    # A later feed refresh must not resurrect the cancelled sessions.
+    sync.synchronize(api, state, [event()], {}, later, ZONE, study_exclusions=exclusions)
+    assert len(api.tasks) == 3
+    assert not any(r['status'] == 'active' for r in studies)
+
+
+def test_api_course_name_exclusion_survives_course_code_alias(tmp_path, snapshot):
+    snapshot['10']['course']['name'] = 'Public Speaking'
+    state, api = sync.SyncState(tmp_path / 'state.json'), FakeTodoist()
+    exclusions = {sync.course_key('Public Speaking')}
+    e = event(snapshot)
+    assert not sync.study_enabled(e, exclusions)
+    sync.synchronize(api, state, [e], snapshot, NOW, ZONE, study_exclusions=exclusions)
+    assert not any(r['kind'] == 'study' for r in state.records.values())
+
+
 def test_all_day_event_uses_start_not_exclusive_end():
     content = ('BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:a\nSUMMARY:Quiz [BIO 1111]\n'
                'DTSTART;VALUE=DATE:20261010\nDTEND;VALUE=DATE:20261011\nEND:VEVENT\nEND:VCALENDAR')

@@ -61,6 +61,8 @@ workflow; it does not activate the live sync.
 If your institution prevents personal API tokens, leave the new secret unset.
 Calendar syncing and title-based study tasks remain available; the script does
 not attempt to bypass Canvas permissions.
+Cal Poly students must use the university's
+[API token request process](https://canvassupport.calpoly.edu/user-token-information-and-request).
 
 ## First-time setup
 
@@ -84,6 +86,13 @@ environment variables when running locally:
 - `STUDY_TIME`: `18:00` in 24-hour HH:MM form.
 - `STUDY_TIMEZONE`: `America/Los_Angeles`; use an IANA zone so daylight-saving
   changes are handled correctly.
+- `STUDY_EXCLUDED_COURSES`: comma-separated course codes or names, such as
+  `COMS-1102-V13-2268,Public Speaking`. Matching ignores case, spaces, and
+  punctuation, but requires the full code or name. Excluded courses keep their
+  assignment deadlines and grade summaries. No study tasks are created for
+  them, and active study tasks previously created by this sync are removed,
+  including overdue sessions. Completed sessions and manually created tasks
+  are preserved. Add a new code if the course code changes in another term.
 - `SYNC_COURSE_GRADES`: `true`; set `false` to stop updating summary tasks.
   Existing summaries stay in place with their last checked date.
 - `REMINDER_DAYS_BEFORE`: `1`; set `0` to disable the assignment deadline
@@ -204,6 +213,8 @@ keep it out of Git and public logs.
   or final are classified automatically; `final project/paper/draft/essay/report/
   presentation` are excluded from title-based exam detection. Canvas online
   quizzes are also recognized through their API metadata.
+  Run logs show aggregate counts of detected assessments, course exclusions,
+  and planned future study sessions, without exposing assignment titles.
 
 ## API references
 

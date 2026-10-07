@@ -34,6 +34,19 @@ def sanitize_label_name(name):
     return re.sub(r'\s+', '_', re.sub(r'[^\w\s-]', '', name)).strip('_')[:60] or 'General'
 
 
+def course_key(name):
+    return re.sub(r'[^a-z0-9]', '', name.casefold())
+
+
+def excluded_course(names, exclusions):
+    return any(course_key(name) in exclusions for name in names if name)
+
+
+def study_enabled(event, exclusions):
+    return (event['kind_label'] and event['study_allowed']
+            and not excluded_course([event['course'], event.get('course_name')], exclusions))
+
+
 def parse_course_name(summary, description=''):
     bracket = re.search(r'\[([^\]]+)\]\s*$', summary)
     if bracket:
@@ -270,6 +283,7 @@ def enrich(events, snapshot, now):
         if context:
             course = context['course']
             event['course'] = course.get('course_code') or course['name']
+            event['course_name'] = course.get('name', '')
             event['url'] = assignment.get('html_url') or event['url']
             event['title'] = assignment.get('name') or event['title']
             if assignment.get('due_at'):
@@ -310,10 +324,23 @@ def assignment_payload(event, project_id):
 
 
 def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study_time='18:00',
-                reminder_days=1, summaries=True, project_name='Canvas Assignments'):
+                reminder_days=1, summaries=True, project_name='Canvas Assignments', study_exclusions=frozenset()):
     project = todoist.project(project_name)
     done = set()
     reminder_failures = 0
+    excluded_uids = {e['uid'] for e in events
+                     if excluded_course([e['course'], e.get('course_name')], study_exclusions)}
+    removed = 0
+    for key, record in list(state.records.items()):
+        if record.get('kind') != 'study' or record.get('status') != 'active':
+            continue
+        # Legacy study records store the course in managed_labels. Use saved
+        # identity too so exclusion removes overdue tasks and absent feed entries.
+        names = [record.get('course'), record.get('course_name'), *record.get('managed_labels', [])]
+        if record['uid'] in excluded_uids or excluded_course(names, study_exclusions):
+            retire(todoist, state, key, delete=True)
+            removed += record['status'] == 'cancelled'
+    logger.info('Removed %d active study tasks for excluded courses.', removed)
 
     def remind(record, when):
         nonlocal reminder_failures
@@ -356,7 +383,7 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
         remind_at = event['due'] - timedelta(days=reminder_days) if reminder_days > 0 else None
         remind(record, remind_at)
         wanted = set()
-        if event['kind_label'] and event['study_allowed']:
+        if study_enabled(event, study_exclusions):
             for when in study_dates(event['due'], now, zone, study_days, study_time):
                 study_key = f'study:{uid}:{when.date().isoformat()}'
                 wanted.add(study_key)
@@ -369,7 +396,8 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
                     'priority': event['priority'], 'due_datetime': when.astimezone(UTC).isoformat(),
                 }
                 study_record = upsert(todoist, state, study_key, study_payload,
-                                      {'kind': 'study', 'uid': uid, 'due': when.isoformat()})
+                                      {'kind': 'study', 'uid': uid, 'due': when.isoformat(),
+                                       'course': event['course'], 'course_name': event.get('course_name', '')})
                 if study_record:
                     remind(study_record, when)
         for old_key, old in list(state.records.items()):
@@ -415,6 +443,8 @@ def main():
     try:
         zone = ZoneInfo(os.getenv('STUDY_TIMEZONE', 'America/Los_Angeles'))
         days, hour = int(os.getenv('STUDY_DAYS_BEFORE', '7')), os.getenv('STUDY_TIME', '18:00')
+        exclusions = {course_key(name) for name in re.split(r'[,\n]', os.getenv('STUDY_EXCLUDED_COURSES', ''))
+                      if course_key(name)}
         if not 0 <= days <= 30 or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', hour):
             raise RuntimeError('Study settings require 0–30 days and a time in HH:MM format.')
         reminder_days = int(os.getenv('REMINDER_DAYS_BEFORE', '1'))
@@ -442,10 +472,17 @@ def main():
             logger.warning('Canvas API is not connected: grade data and verified auto-completion are unavailable.')
         enrich(events, snapshot, now)
         upcoming = [e for e in events if e['due'] > now and not e['submitted']]
+        assessments = [e for e in upcoming if e['kind_label']]
+        eligible = [e for e in upcoming if study_enabled(e, exclusions)]
+        excluded_count = sum(excluded_course([e['course'], e.get('course_name')], exclusions) for e in assessments)
+        session_count = sum(len(study_dates(e['due'], now, zone, days, hour)) for e in eligible)
+        logger.info('Calendar: %d upcoming entries; %d assessments detected; %d excluded by course; '
+                    '%d eligible assessments; %d future study sessions planned.',
+                    len(upcoming), len(assessments), excluded_count, len(eligible), session_count)
         if args.preview_file:
             preview = {'assignments': [assignment_payload(e, '(preview)') for e in upcoming],
                        'study_sessions': [{'assignment': e['title'], 'at': at.isoformat()}
-                                          for e in upcoming if e['kind_label'] and e['study_allowed']
+                                          for e in eligible
                                           for at in study_dates(e['due'], now, zone, days, hour)],
                        'course_grades': [{'course': c['course'].get('course_code'),
                                           'current_score': current_grade(c['course'])} for c in snapshot.values()]}
@@ -460,7 +497,7 @@ def main():
             raise RuntimeError('TODOIST_API_TOKEN is required for a live sync.')
         synchronize(Todoist(api_token), state, events, snapshot, now, zone, days, hour,
                     reminder_days, os.getenv('SYNC_COURSE_GRADES', 'true').lower() == 'true',
-                    os.getenv('TODOIST_PROJECT_NAME', 'Canvas Assignments'))
+                    os.getenv('TODOIST_PROJECT_NAME', 'Canvas Assignments'), exclusions)
         state.save()
         logger.info('Sync completed. Task details and grades are omitted from logs.')
         return 0
