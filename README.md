@@ -5,7 +5,7 @@ schedule a week of study tasks before tests and quizzes.
 
 ## What appears in Todoist
 
-- **Canvas Assignments:** assignment tasks with the original deadline, a stable
+- **Canvas Assignments:** assignment tasks with the Canvas deadline, a stable
   course label, a Canvas link, and the estimated percentage of the final grade
   in the description when the available grading data supports it.
 - **Study tasks:** one task at **6 PM America/Los_Angeles** on each of the
@@ -18,6 +18,48 @@ schedule a week of study tasks before tests and quizzes.
 - **Labels:** the course code, `Exam`, `Quiz`, `Study`, `Grade`, and
   `High_grade_impact` (estimated weight at least 5%). Grades do not change course
   label names, so saved filters remain stable.
+
+### Deadlines and planned work dates
+
+Canvas owns the **deadline**. You own Todoist's **date/time** (when you plan to
+work). New assignment tasks have a deadline and start without a planned work
+date. Existing tasks keep their date, time, duration, and recurrence. Sync never
+sends a `due`, `due_date`, `due_datetime`, or other `due_*` field when updating a
+task, including when its title, priority, grade context, or Canvas deadline changes.
+Existing dates that were previously copied from Canvas are left in place too:
+there is no reliable way to distinguish those from dates you chose yourself.
+This prevents future resets; it cannot recover plans erased by earlier runs.
+
+Todoist's `deadline_date` stores the Canvas deadline's calendar day in
+`STUDY_TIMEZONE`. Todoist deadlines have no time component, so the exact Canvas
+cutoff, explicit UTC offset/timezone, source, and assignment link are kept near
+the top of the description. All-day calendar entries are explicitly marked as
+date-only; the sync does not invent an exact cutoff for them. Fixed deadlines
+can coexist with recurring work dates.
+
+Generated descriptions use `[Canvas sync]` / `[/Canvas sync]` markers. Add your
+notes outside that block. Upgrades preserve the entire old description because
+it may contain planning notes; a new managed block is appended once. If you
+edit inside the block, that edited text is preserved and a fresh block is added
+on the next source update. An overfull description stops the update rather than
+silently truncating your notes. Retries recognize a block already written.
+
+New study tasks still receive the configured initial time. Once created, their
+date/time is also left alone. Changing `STUDY_TIME` affects new sessions, not
+existing plans. Manually moved, undated, all-day, or recurring study sessions
+are protected from automatic deletion when a deadline changes, a course is
+excluded, or the parent completes. Such obsolete sessions are handed back to
+you and are no longer managed or recreated by the sync. Recurring assignment
+tasks are not automatically completed, since doing so would advance their
+recurrence.
+
+Assignment reminders continue to use the Canvas cutoff. Study reminders follow
+the task's current explicit non-recurring time, even after its original slot
+has passed. For undated, all-day, recurring, or floating times without a known
+timezone, only the sync-owned absolute reminder is removed; no time is guessed.
+Your other reminders are left alone. Set a Todoist reminder yourself for these
+plans if needed. A protected session handed back to you keeps its owned reminder
+aligned with its explicit current plan at that handoff; later edits are yours.
 
 An illustrative assignment description, using fictional data:
 
@@ -91,8 +133,9 @@ environment variables when running locally:
   punctuation, but requires the full code or name. Excluded courses keep their
   assignment deadlines and grade summaries. No study tasks are created for
   them, and active study tasks previously created by this sync are removed,
-  including overdue sessions. Completed sessions and manually created tasks
-  are preserved. Add a new code if the course code changes in another term.
+  including overdue sessions, unless you changed their work date/recurrence.
+  Completed sessions and manually created tasks are preserved. Add a new code
+  if the course code changes in another term.
 - `SYNC_COURSE_GRADES`: `true`; set `false` to stop updating summary tasks.
   Existing summaries stay in place with their last checked date.
 - `REMINDER_DAYS_BEFORE`: `1`; set `0` to disable the assignment deadline
@@ -108,6 +151,8 @@ Todoist push notifications must be enabled on your device, and your account
 must permit reminders. A failed reminder leaves its task saved and is retried
 on the next sync. The run reports failure instead of claiming all notifications
 were configured. Other assignments and grade summaries still get processed.
+Your Todoist account must also support deadlines; an API rejection is reported
+rather than falling back to overwriting your planned work date.
 
 Useful Todoist filter queries you can save manually:
 
@@ -151,13 +196,14 @@ are auto-completed only when Canvas's API confirms the current user's
 submission or excusal. Missing-work automatic zeroes are not treated as proof
 of submission. Without the API, complete tasks manually in Todoist.
 
-Completed or manually deleted tasks are not recreated. Future study tasks are
-removed when the parent assignment is completed, or when a changed deadline
-makes those sessions obsolete. Study tasks cancelled by the sync can return if
-the assessment moves back to their dates; manually completed tasks stay done.
+Completed or manually deleted tasks are not recreated. Untouched future study
+tasks are removed when the parent assignment is completed, or when a changed
+deadline makes those sessions obsolete. Manually rescheduled or recurring
+sessions are preserved as described above. Study tasks cancelled by the sync
+can return if the assessment moves back; manually completed tasks stay done.
 
-Deadlines are sent with explicit time zones, and all-day calendar entries stay
-on their original date. Priorities are recalculated each run (within 1 day P1,
+Exact Canvas cutoffs are retained with explicit time zones, and all-day calendar
+entries stay on their original date. Priorities are recalculated each run (within 1 day P1,
 within 3 days P2, within 7 days P3, later P4).
 
 The workflow requests a run every five minutes, but GitHub schedules can be
@@ -170,8 +216,11 @@ the persistent state remains necessary because API idempotency is not an
 unlimited replacement for history. If state is missing or corrupt, the live
 sync stops instead of assuming a fresh account and creating duplicates.
 
-The state contains task IDs, source assignment identifiers, due dates, labels,
-and change hashes, not grade scores or API tokens. GitHub caches are not a
+The state contains task IDs, source assignment identifiers, Canvas deadline
+dates/exact cutoffs/source, observed planned dates and recurrence flags, original
+generated study times, labels, and change hashes, not grade scores, descriptions,
+or API tokens. These fields extend version 2 in place; legacy records are
+migrated without replacing task IDs. GitHub caches are not a
 secret store. Use a private repository if course labels or scheduling metadata
 must also remain private. Detailed previews stay local and are never uploaded
 by the workflow.
@@ -197,6 +246,24 @@ For an intentional first live sync only, use `python sync.py --initialize-state`
 After that, use `python sync.py`. `--dry-run` never contacts Todoist or writes
 state. The optional preview contains private assignment/grade information;
 keep it out of Git and public logs.
+
+Tests use synthetic Canvas data and an in-memory Todoist fake. A network-blocking
+fixture prevents accidental live API requests. The regression suite covers
+priority/title/deadline updates, manual notes, recurring and completed tasks,
+legacy state, retries after uncertain writes, local dates/DST, and study reminders.
+
+### Review and rollback
+
+Keep this change on a feature branch until reviewed. Its test workflow has no
+Canvas/Todoist secrets; the live workflow remains on `master`. Merging sync code
+to `master` starts a live sync, so review that transition separately. Preserve
+the existing state cache; do not initialize a new state over existing tasks.
+
+Code changes can be reverted with Git. Reverting to the previous sync also
+restores its planned-date reset behavior. If rolling back, stop the scheduled
+live sync before running that older version against your plans. A code revert
+does not undo task changes already applied by a live run. No rollback, deployment,
+workflow change, or live task repair is performed by the offline tests.
 
 ## Troubleshooting
 
@@ -226,3 +293,4 @@ keep it out of Git and public logs.
 ## License
 
 MIT, as stated by the original template.
+
