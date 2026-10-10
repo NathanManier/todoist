@@ -75,6 +75,9 @@ class FakeTodoist:
             target = self.tasks if path == 'tasks' else self.reminders
             identifier = str(len(self.idempotency) + 1)
             result = {'id': identifier, **copy.deepcopy(payload)}
+            if path == 'tasks':
+                value = payload.get('due_datetime') or payload.get('due_date')
+                result['due'] = {'date': value, 'timezone': None, 'is_recurring': False} if value else None
             target[identifier] = result
             self.idempotency[key] = copy.deepcopy(result)
             return copy.deepcopy(result)
@@ -409,7 +412,9 @@ def test_deadline_moved_to_past_updates_parent_and_cancels_future_study(tmp_path
     e['priority'] = 4
     run(api, state, [e])
     task = api.tasks[state.records['assignment:event-assignment-11']['task_id']]
-    assert task['due_datetime'] == e['due'].isoformat()
+    assert task['deadline_date'] == e['due'].astimezone(ZONE).date().isoformat()
+    assert task['due'] is None
+    assert state.records['assignment:event-assignment-11']['canvas_deadline_at'] == e['due'].isoformat()
     assert not any(r['kind'] == 'study' and r['status'] == 'active' for r in state.records.values())
 
 
@@ -445,3 +450,4 @@ def test_canvas_failure_is_before_any_todoist_contact(tmp_path, monkeypatch):
     monkeypatch.setattr(sync, 'Todoist', todoist)
     assert sync.main() == 1
     todoist.assert_not_called()
+

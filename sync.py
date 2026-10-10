@@ -20,6 +20,13 @@ from canvas_data import (CanvasClient, assessment_type, confirmed_submitted,
 
 UTC = timezone.utc
 logger = logging.getLogger(__name__)
+MANAGED_START = '[Canvas sync]'
+MANAGED_END = '[/Canvas sync]'
+DESCRIPTION_LIMIT = 16383
+
+
+class RetirementReminderError(RuntimeError):
+    """A protected task remains active until its owned reminder can be aligned."""
 
 
 def fingerprint(value):
@@ -176,6 +183,76 @@ def active(task):
     return task is not None and not any(task.get(field) for field in ('checked', 'is_completed', 'is_deleted'))
 
 
+def recurring(task):
+    return bool((task.get('due') or {}).get('is_recurring'))
+
+
+def managed_description(text):
+    room = DESCRIPTION_LIMIT - len(MANAGED_START) - len(MANAGED_END) - 2
+    return f'{MANAGED_START}\n{text[:room]}\n{MANAGED_END}'
+
+
+def merge_description(existing, desired, record):
+    """Replace only a previously saved, unedited generated block.
+
+    Old versions owned the whole description but did not save its contents.
+    Preserve that text on migration: it may contain the user's planning notes.
+    Also preserve any edits made inside a generated block instead of guessing.
+    """
+    expected = record.get('managed_description_hash')
+    pattern = re.escape(MANAGED_START) + r'\n.*?\n' + re.escape(MANAGED_END)
+    matches = list(re.finditer(pattern, existing, re.DOTALL))
+    if any(match.group() == desired for match in matches):
+        return existing  # A prior POST may have succeeded before its response/state save failed.
+    for match in matches:
+        if expected and fingerprint(match.group()) == expected:
+            merged = existing[:match.start()] + desired + existing[match.end():]
+            break
+    else:
+        merged = existing + ('\n\n' if existing else '') + desired
+    if len(merged) > DESCRIPTION_LIMIT:
+        raise RuntimeError('Task description has no room for Canvas metadata. '
+                           'Existing notes were preserved; shorten the description and retry.')
+    return merged
+
+
+def planned_due(task):
+    """Snapshot scheduling fields without copying task text or grade data."""
+    due = task.get('due')
+    return {k: due[k] for k in ('date', 'datetime', 'timezone', 'is_recurring') if k in due} if due else None
+
+
+def planned_instant(record):
+    due = record.get('planned_work_due') or {}
+    value = due.get('datetime') or due.get('date', '')
+    if due.get('is_recurring') or 'T' not in value:
+        return None  # Never guess a time for an undated/all-day/recurring plan.
+    try:
+        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if result.tzinfo:
+            return result
+        if due.get('timezone'):
+            return result.replace(tzinfo=ZoneInfo(due['timezone']))
+        return None  # Todoist floating time need not use the study-generation zone.
+    except (ValueError, KeyError):
+        return None
+
+
+def study_plan_changed(task, record):
+    """A moved, undated, or recurring session belongs to the user's plan."""
+    if recurring(task):
+        return True
+    due = task.get('due') or {}
+    value = due.get('datetime') or due.get('date', '')
+    try:
+        current = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        original = datetime.fromisoformat(record.get('managed_study_due', record['due']).replace('Z', '+00:00'))
+        # Floating/all-day dates are deliberately not inferred to be unchanged.
+        return current.tzinfo is None or current != original
+    except (ValueError, KeyError):
+        return True
+
+
 def upsert(todoist, state, key, payload, metadata):
     record = state.records.get(key)
     generation = (record or {}).get('generation', 0)
@@ -195,17 +272,33 @@ def upsert(todoist, state, key, payload, metadata):
             manual = set(existing.get('labels', [])) - set(record.get('managed_labels', []))
             updated = {**payload, 'labels': sorted(manual | set(payload['labels']))}
             updated.pop('project_id', None)
+            # Todoist's due is the user's work plan, including time/recurrence.
+            # Never send scheduling fields on updates, even if Canvas changed.
+            for field in list(updated):
+                if field == 'due' or field.startswith('due_'):
+                    updated.pop(field)
+            if metadata.get('kind') in ('assignment', 'study'):
+                updated['description'] = merge_description(existing.get('description') or '',
+                                                           payload['description'], record)
             todoist.ensure_labels(payload['labels'])
             todoist.call('POST', 'tasks/' + record['task_id'], updated,
                          key=str(uuid.uuid4()))
+        record['planned_work_due'] = planned_due(existing)
     else:
         todoist.ensure_labels(payload['labels'])
         task = todoist.call('POST', 'tasks', payload,
                             key=f"create:{payload['project_id']}:{key}:{generation}")
         record = {'task_id': str(task['id']), 'status': 'active', 'generation': generation}
+        record['planned_work_due'] = planned_due(task)
         state.records[key] = record
+    if metadata.get('kind') == 'study':
+        # Never move this baseline after creation: schedule preferences may
+        # later happen to match a date/time the user chose by hand.
+        record.setdefault('managed_study_due', record.get('due', metadata['due']))
     record.update(metadata)
     record.update(payload_hash=digest, managed_labels=payload['labels'])
+    if metadata.get('kind') in ('assignment', 'study'):
+        record['managed_description_hash'] = fingerprint(payload['description'])
     state.save()  # Commit task ID before a reminder can fail.
     return record
 
@@ -253,11 +346,26 @@ def sync_reminder(todoist, state, record, when, now):
     state.save()
 
 
-def retire(todoist, state, key, delete=False):
+def retire(todoist, state, key, delete=False, now=None):
     record = state.records[key]
     if record.get('status') != 'active':
         return
     task = todoist.call('GET', 'tasks/' + record['task_id'], missing_ok=True)
+    if active(task) and (recurring(task) or (delete and record.get('kind') == 'study'
+                                          and study_plan_changed(task, record))):
+        # Auto-retiring would delete a hand-planned session or advance a repeat.
+        # Stop owning this task; a later feed refresh must not recreate it.
+        record['planned_work_due'] = planned_due(task)
+        # Align a moved session's owned reminder with its explicit current plan.
+        # Submitted recurring assignments no longer need a deadline reminder.
+        when = planned_instant(record) if record.get('kind') == 'study' else None
+        try:
+            sync_reminder(todoist, state, record, when, now or datetime.now(UTC))
+        except RuntimeError as error:
+            raise RetirementReminderError(str(error)) from None
+        record['status'] = 'manual'
+        state.save()
+        return
     if active(task):
         method, suffix = ('DELETE', '') if delete else ('POST', '/close')
         todoist.call(method, 'tasks/' + record['task_id'] + suffix,
@@ -300,27 +408,44 @@ def enrich(events, snapshot, now):
     return events
 
 
-def assignment_payload(event, project_id):
+def canvas_deadline(event, zone):
+    date = event['due'].date() if event['date_only'] else event['due'].astimezone(zone).date()
+    return {'canvas_deadline_date': date.isoformat(),
+            'canvas_deadline_at': None if event['date_only'] else event['due'].isoformat(),
+            'canvas_deadline_source': 'Canvas API' if (event.get('assignment') or {}).get('due_at') else 'Canvas calendar',
+            'canvas_url': event['url']}
+
+
+def assignment_metadata(event, zone):
+    return {'kind': 'assignment', 'uid': event['uid'], 'due': event['due'].isoformat(),
+            **canvas_deadline(event, zone)}
+
+
+def assignment_payload(event, project_id, zone=None):
+    zone = zone or event['due'].tzinfo
     labels = [sanitize_label_name(event['course'])]
     if event['kind_label']:
         labels.append(event['kind_label'])
     impact = event['impact']
     if impact is not None and impact >= 5:
         labels.append('High_grade_impact')
-    description = f"Course: {event['course']}\n"
+    deadline = canvas_deadline(event, zone)
+    cutoff = (f"{event['due'].astimezone(zone).isoformat()} ({zone})" if not event['date_only'] else
+              deadline['canvas_deadline_date'] + ' (date only; exact cutoff not provided)')
+    description = f"Canvas deadline: {cutoff}\nDeadline source: {deadline['canvas_deadline_source']}\n"
+    if event['url']:
+        description += f"Canvas: {event['url']}\n"
+    description += f"Course: {event['course']}\n"
     if impact is not None:
         description += f"Estimated share of final grade: {impact:.2f}%\n"
     description += event['impact_note'] + '\n'
     points = (event['assignment'] or {}).get('points_possible')
     if points is not None:
         description += f'Points possible: {points}\n'
-    if event['url']:
-        description += f"\nCanvas: {event['url']}\n"
     description += '\n' + event['description']
-    due = {'due_date': event['due'].date().isoformat()} if event['date_only'] else {
-        'due_datetime': event['due'].astimezone(UTC).isoformat()}
     return {'content': event['title'][:500], 'project_id': project_id,
-            'description': description[:16383], 'labels': labels, 'priority': event['priority'], **due}
+            'description': managed_description(description), 'labels': labels, 'priority': event['priority'],
+            'deadline_date': deadline['canvas_deadline_date']}
 
 
 def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study_time='18:00',
@@ -328,6 +453,14 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
     project = todoist.project(project_name)
     done = set()
     reminder_failures = 0
+
+    def retire_task(key, delete=False):
+        nonlocal reminder_failures
+        try:
+            retire(todoist, state, key, delete=delete, now=now)
+        except RetirementReminderError:
+            reminder_failures += 1  # Keep active for retry; other tasks still sync.
+
     excluded_uids = {e['uid'] for e in events
                      if excluded_course([e['course'], e.get('course_name')], study_exclusions)}
     removed = 0
@@ -338,7 +471,7 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
         # identity too so exclusion removes overdue tasks and absent feed entries.
         names = [record.get('course'), record.get('course_name'), *record.get('managed_labels', [])]
         if record['uid'] in excluded_uids or excluded_course(names, study_exclusions):
-            retire(todoist, state, key, delete=True)
+            retire_task(key, delete=True)
             removed += record['status'] == 'cancelled'
     logger.info('Removed %d active study tasks for excluded courses.', removed)
 
@@ -353,30 +486,29 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
             continue
         assignment, _ = match_assignment({'uid': record['uid'], 'url': record.get('canvas_url', '')}, snapshot)
         if confirmed_submitted(assignment):
-            retire(todoist, state, key)
+            retire_task(key)
             done.add(record['uid'])
     for event in events:
         uid, key = event['uid'], 'assignment:' + event['uid']
         record = state.records.get(key)
         if event['submitted']:
             if record:
-                retire(todoist, state, key)
+                retire_task(key)
             done.add(uid)
             continue
         if event['due'] <= now:
             if record:
-                existing_record = upsert(todoist, state, key, assignment_payload(event, project),
-                                         {'kind': 'assignment', 'uid': uid, 'due': event['due'].isoformat(),
-                                          'canvas_url': event['url']})
+                existing_record = upsert(todoist, state, key, assignment_payload(event, project, zone),
+                                         assignment_metadata(event, zone))
                 if existing_record:
                     remind(existing_record, None)
             for old_key, old in list(state.records.items()):
                 if old.get('kind') == 'study' and old['uid'] == uid and datetime.fromisoformat(old['due']) > now:
-                    retire(todoist, state, old_key, delete=True)
+                    retire_task(old_key, delete=True)
             continue
-        payload = assignment_payload(event, project)
+        payload = assignment_payload(event, project, zone)
         record = upsert(todoist, state, key, payload,
-                        {'kind': 'assignment', 'uid': uid, 'due': event['due'].isoformat(), 'canvas_url': event['url']})
+                        assignment_metadata(event, zone))
         if record is None:
             done.add(uid)
             continue
@@ -389,24 +521,35 @@ def synchronize(todoist, state, events, snapshot, now, zone, study_days=7, study
                 wanted.add(study_key)
                 study_payload = {
                     'content': f"Study: {event['title']} — {event['course']}"[:500],
-                    'description': (f"Prepare for {event['title']}.\n"
-                                    f"Assessment due: {event['due'].astimezone(zone).strftime('%b %d, %Y at %I:%M %p %Z')}\n\n"
-                                    + payload['description'])[:16383],
+                    'description': managed_description(f"Prepare for {event['title']}.\n"
+                                    f"Assessment due: {event['due'].astimezone(zone).isoformat()}\n"
+                                    f"Canvas: {event['url']}\nCourse: {event['course']}"),
                     'project_id': project, 'labels': [*payload['labels'], 'Study'],
                     'priority': event['priority'], 'due_datetime': when.astimezone(UTC).isoformat(),
                 }
-                study_record = upsert(todoist, state, study_key, study_payload,
+                upsert(todoist, state, study_key, study_payload,
                                       {'kind': 'study', 'uid': uid, 'due': when.isoformat(),
                                        'course': event['course'], 'course_name': event.get('course_name', '')})
-                if study_record:
-                    remind(study_record, when)
         for old_key, old in list(state.records.items()):
             if old.get('kind') == 'study' and old['uid'] == uid and old_key not in wanted:
                 if datetime.fromisoformat(old['due']) > now:
-                    retire(todoist, state, old_key, delete=True)
+                    retire_task(old_key, delete=True)
     for key, record in list(state.records.items()):
         if record.get('kind') == 'study' and record['uid'] in done:
-            retire(todoist, state, key, delete=True)
+            retire_task(key, delete=True)
+    # Refresh every active session, including ones whose original generated
+    # slot has passed but whose user-planned work date is still ahead.
+    for record in state.records.values():
+        if record.get('kind') != 'study' or record.get('status') != 'active':
+            continue
+        task = todoist.call('GET', 'tasks/' + record['task_id'], missing_ok=True)
+        if not active(task):
+            record['status'] = 'done'
+            state.save()
+            continue
+        record['planned_work_due'] = planned_due(task)
+        remind(record, planned_instant(record))
+        state.save()
     if summaries and snapshot:
         grades_project = todoist.project('Canvas Grades')
         for cid, context in snapshot.items():
@@ -480,7 +623,7 @@ def main():
                     '%d eligible assessments; %d future study sessions planned.',
                     len(upcoming), len(assessments), excluded_count, len(eligible), session_count)
         if args.preview_file:
-            preview = {'assignments': [assignment_payload(e, '(preview)') for e in upcoming],
+            preview = {'assignments': [assignment_payload(e, '(preview)', zone) for e in upcoming],
                        'study_sessions': [{'assignment': e['title'], 'at': at.isoformat()}
                                           for e in eligible
                                           for at in study_dates(e['due'], now, zone, days, hour)],
@@ -514,3 +657,4 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
